@@ -145,6 +145,7 @@
             this.listEntries.KeyDown += new System.Windows.Forms.KeyEventHandler(this.listEntries_KeyDown);
             this.listEntries.MouseMove += new System.Windows.Forms.MouseEventHandler(this.listEntries_MouseMove);
             this.listEntries.MouseDown += new System.Windows.Forms.MouseEventHandler(this.listEntries_MouseDown);
+            this.listEntries.MouseLeave += new System.EventHandler(this.listEntries_MouseLeave);
             this.listEntries.ContextMenuStrip = this.cmsGrid;
             // context menu
             this.cmsGrid.Items.AddRange(new System.Windows.Forms.ToolStripItem[] { this.miCopy, this.miEdit, this.miDelete });

@@ -32,6 +32,8 @@ public partial class CmdKitForm : Form
     private const int HOTKEY_ID = 0x1100; // arbitrary id
     private CancellationTokenSource? _filterCts;
     private readonly HashSet<string> _kinds = new(StringComparer.OrdinalIgnoreCase) { "Command", "Link" };
+    private System.Windows.Forms.Timer _tooltipTimer = new();
+    private int _hoverIndex = -1;
 
     [DllImport("user32.dll")] private static extern bool RegisterHotKey(IntPtr hWnd, int id, int fsModifiers, int vk);
     [DllImport("user32.dll")] private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
@@ -57,6 +59,8 @@ public partial class CmdKitForm : Form
         if (_trayIcon != null && this.Icon != null) _trayIcon.Icon = this.Icon;
         this.HandleCreated += (s, e) => TryRegisterHotKey();
         this.FormClosing += CmdKitForm_FormClosing;
+
+        _tooltipTimer.Interval = 200; _tooltipTimer.Tick += TooltipTimer_Tick; _tooltipTimer.Start();
     }
 
     private string GetActiveDataDir()
@@ -280,30 +284,30 @@ public partial class CmdKitForm : Form
     private void listEntries_MouseMove(object sender, MouseEventArgs e)
     {
         int index = listEntries.IndexFromPoint(e.Location);
-        if (index >= 0 && index < listEntries.Items.Count)
+        if (index != _hoverIndex)
         {
-            var name = listEntries.Items[index].ToString();
-            var entry = _all.FirstOrDefault(x => x.Name == name);
-            if (entry != null && (DateTime.Now - _lastToolTipTime).TotalMilliseconds > 300)
-            {
-                string tip;
-                if (entry.IsEncrypted)
-                {
-                    if ((ModifierKeys & Keys.Shift) == Keys.Shift)
-                    {
-                        tip = SecretProtector.Unprotect(entry.Value);
-                    }
-                    else
-                    {
-                        var plain = SecretProtector.Unprotect(entry.Value);
-                        tip = entry.Name + " (secret)\n" + new string('*', Math.Min(plain.Length, 6)) + "  (Hold Shift to view)";
-                    }
-                }
-                else tip = entry.Value;
-                _listTooltip.SetToolTip(listEntries, tip);
-                _lastToolTipTime = DateTime.Now;
-            }
+            _hoverIndex = index;
+            _lastToolTipTime = DateTime.MinValue; // force update next tick
         }
+    }
+    private void listEntries_MouseLeave(object? sender, EventArgs e)
+    { _hoverIndex = -1; _listTooltip.Hide(listEntries); }
+    private void TooltipTimer_Tick(object? sender, EventArgs e)
+    {
+        if (_hoverIndex < 0 || _hoverIndex >= listEntries.Items.Count) return;
+        if ((DateTime.Now - _lastToolTipTime).TotalMilliseconds < 350) return;
+        var name = listEntries.Items[_hoverIndex].ToString();
+        var entry = _all.FirstOrDefault(x => x.Name == name);
+        if (entry == null) return;
+        string tip;
+        if (entry.IsEncrypted)
+        {
+            if ((ModifierKeys & Keys.Shift) == Keys.Shift) tip = SecretProtector.Unprotect(entry.Value);
+            else { var plain = SecretProtector.Unprotect(entry.Value); tip = entry.Name + " (secret)\n" + new string('*', Math.Min(plain.Length, 6)) + "  (Hold Shift to view)"; }
+        }
+        else tip = entry.Value;
+        _listTooltip.SetToolTip(listEntries, tip);
+        _lastToolTipTime = DateTime.Now;
     }
     private void listEntries_MouseDown(object sender, MouseEventArgs e)
     { if (e.Button == MouseButtons.Right) { int index = listEntries.IndexFromPoint(e.Location); if (index >= 0 && index < listEntries.Items.Count) listEntries.SelectedIndex = index; } }
@@ -478,6 +482,8 @@ public partial class CmdKitForm : Form
             _filterCts?.Dispose();
             _listTooltip?.Dispose();
             _trayIcon?.Dispose();
+            _tooltipTimer?.Stop();
+            _tooltipTimer?.Dispose();
         }
         base.Dispose(disposing);
     }
