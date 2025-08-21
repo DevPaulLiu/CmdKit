@@ -15,4 +15,8 @@
     </Content>
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="SunnyUI" Version="3.8.7" />
+  </ItemGroup>
+
 </Project>
