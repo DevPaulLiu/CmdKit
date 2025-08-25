@@ -10,6 +10,7 @@ public class AppSettings
     public AppTheme Theme { get; set; } = AppTheme.Dark; // supports Dark, Light, Blossom
     public bool AutoCloseAfterCopy { get; set; } = true; // new setting
     public List<string> SensitivePatterns { get; set; } = new() { "password", "token", "secret", "pwd", "api[-_]?key" }; // regex patterns (case-insensitive)
+    public float UiFontSize { get; set; } = 10f; // user configurable base UI font size
 
     public static string GetSettingsFile()
     {

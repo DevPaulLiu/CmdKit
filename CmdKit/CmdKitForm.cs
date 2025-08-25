@@ -26,54 +26,115 @@ public partial class CmdKitForm : Sunny.UI.UIForm
     private AppSettings _settings = AppSettings.Load();
     private NotifyIcon? _trayIcon;
     private bool _allowExit = false;
-    private const int WM_HOTKEY = 0x0312;
-    private const int MOD_CONTROL = 0x0002;
-    private const int HOTKEY_ID = 0x1100; // arbitrary id
+    private GlobalHotkeyHost? _hotkeyHost; // persistent hidden window for global hotkey
     private CancellationTokenSource? _filterCts;
     internal readonly HashSet<string> _kinds = new(StringComparer.OrdinalIgnoreCase) { "Command", "Link", "URL", "Password" };
     private readonly System.Windows.Forms.Timer _tooltipTimer = new();
+    private readonly System.Windows.Forms.Timer _searchEnforceTimer = new();
     private int _hoverIndex = -1;
-    private readonly Font _uiFont = CreateUiFont();
+    private Font _uiFont; // created in ctor using settings size
     private Font? _tooltipFontCjk; // fallback for CJK
-    private bool _themeReappliedAfterShown = false; // ensure dark theme reapplied once after shown
-    private bool _titleFontAdjusted = false; // ensure title font sized only once consistently
-    private float? _titleFontBaseSize = null; // original title font size
     private bool _pendingDarkIdleFix = false; // schedule dark idle palette enforcement
+    private readonly HashSet<int> _multiSelected = new();
+    private int _multiAnchor = -1;
+    private Color _currentAccent = Color.SteelBlue; // updated by ApplyTheme
+    private Color _multiSelectFill = Color.FromArgb(200, 70, 130, 180);
+    private Color _multiSelectBorder = Color.FromArgb(255, 255, 255, 255);
+    private bool _isDarkTheme = true;
+    private bool _titleFontAdjusted = false; // added back for ApplyFixedTitleFont
 
-    private static Font CreateUiFont()
+    private static Font CreateUiFont(float size = 10f)
     {
-        // Target Aptos 8pt; fallback to Segoe UI if Aptos not installed
-        const float size = 8f; // previously 9f
         try { return new Font("Aptos", size, FontStyle.Regular, GraphicsUnit.Point); } catch { }
         try { return new Font("Aptos Display", size, FontStyle.Regular, GraphicsUnit.Point); } catch { }
         try { return new Font("Segoe UI", size, FontStyle.Regular, GraphicsUnit.Point); } catch { }
         return SystemFonts.DefaultFont;
     }
 
-    [DllImport("user32.dll")] private static extern bool RegisterHotKey(IntPtr hWnd, int id, int fsModifiers, int vk);
-    [DllImport("user32.dll")] private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
-    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
-    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-    private const int SW_SHOW = 5;
+    // Helper to set Sunny.UI reflection properties safely
+    private void TrySetProp(object target, string propName, object? value)
+    { try { var p = target.GetType().GetProperty(propName); p?.SetValue(target, value); } catch { } }
+
+    // Force inner native TextBox inside Sunny.UI.UITextBox to adopt our dark theme colors
+    private void FixSearchInnerColors()
+    {
+        if (txtSearch == null) return;
+        Color back = txtSearch.FillColor;
+        Color fore = txtSearch.ForeColor == Color.Empty ? Color.White : txtSearch.ForeColor;
+        try
+        {
+            // Force all relevant state colors on the Sunny.UI UITextBox itself
+            TrySetProp(txtSearch, "FillHoverColor", back);
+            TrySetProp(txtSearch, "FillPressColor", back);
+            TrySetProp(txtSearch, "FillSelectedColor", back);
+            TrySetProp(txtSearch, "FillFocusColor", back); // if exists
+            TrySetProp(txtSearch, "RectHoverColor", txtSearch.RectColor);
+            TrySetProp(txtSearch, "RectFocusColor", txtSearch.RectColor);
+            foreach (Control c in txtSearch.Controls)
+            {
+                if (c is TextBox inner)
+                {
+                    inner.BackColor = back;
+                    inner.ForeColor = fore;
+                    inner.BorderStyle = BorderStyle.None;
+                    inner.Cursor = Cursors.IBeam;
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void ForceSearchColorsDark()
+    {
+        if (_settings.Theme != AppTheme.Dark || txtSearch == null) return;
+        var (_, surface, _, text, border, _, _) = GetTheme();
+        txtSearch.StyleCustomMode = true;
+        txtSearch.FillColor = surface;
+        TrySetProp(txtSearch, "FillColor2", surface);
+        TrySetProp(txtSearch, "FillHoverColor", surface);
+        TrySetProp(txtSearch, "FillPressColor", surface);
+        TrySetProp(txtSearch, "FillFocusColor", surface);
+        TrySetProp(txtSearch, "FillSelectedColor", surface);
+        txtSearch.RectColor = border;
+        TrySetProp(txtSearch, "RectHoverColor", border);
+        TrySetProp(txtSearch, "RectFocusColor", border);
+        txtSearch.ForeColor = text;
+        FixSearchInnerColors();
+    }
 
     public CmdKitForm()
     {
         InitializeComponent();
+        _uiFont = CreateUiFont(_settings.UiFontSize);
+        // enable window resizing (Sunny.UI.UIForm specific + standard)
+        this.FormBorderStyle = FormBorderStyle.Sizable;
+        this.MaximizeBox = true; this.MinimizeBox = true;
+        try { this.ShowDragStretch = true; } catch { } // Sunny.UI specific (ignore if property missing)
+        this.MinimumSize = new Size(480, 250);
+        _dataFile = Path.Combine(GetActiveDataDir(), "commands.json");
+        // create persistent hotkey host (independent of form handle)
+        _hotkeyHost = new GlobalHotkeyHost(this);
         _listTooltip.OwnerDraw = true;
         _listTooltip.Draw += ListTooltip_Draw;
         _listTooltip.Popup += ListTooltip_Popup;
+        // Enable double buffering on the list control (Sunny.UI.UIListBox) to reduce scroll flicker
+        TryEnableDoubleBuffer(listEntries);
         AdjustLayout();
         this.Resize += (_, _) => AdjustLayout();
         ApplyGlobalFont(this.Controls);
-        var icoPath = Path.Combine(AppContext.BaseDirectory, "CmdKit.ico");
-        if (!File.Exists(icoPath))
+        // configure search enforce timer
+        _searchEnforceTimer.Interval = 120; // frequent enough to beat library repaint
+        _searchEnforceTimer.Tick += (s, e) =>
         {
-            var subPath = Path.Combine(AppContext.BaseDirectory, "Resources", "CmdKit.ico");
-            if (File.Exists(subPath)) icoPath = subPath;
-        }
-        if (File.Exists(icoPath)) { try { this.Icon = new Icon(icoPath); } catch { } }
-        this.ShowIcon = true;
-        _dataFile = Path.Combine(GetActiveDataDir(), "commands.json");
+            if (_settings.Theme == AppTheme.Dark && txtSearch != null && (txtSearch.Focused || txtSearch.ClientRectangle.Contains(txtSearch.PointToClient(Cursor.Position))))
+            {
+                ForceSearchColorsDark();
+            }
+            else if (_searchEnforceTimer.Enabled && (txtSearch == null || (!txtSearch.Focused && !txtSearch.ClientRectangle.Contains(txtSearch.PointToClient(Cursor.Position)))))
+            {
+                _searchEnforceTimer.Stop();
+            }
+        };
         ApplyTheme(); // initial
         if (_settings.Theme == AppTheme.Dark)
         {
@@ -85,7 +146,6 @@ public partial class CmdKitForm : Sunny.UI.UIForm
         this.Shown += (s, e) => { if (_settings.Theme == AppTheme.Dark) { BeginInvoke(new Action(() => ApplyTheme())); } };
         InitTray();
         if (_trayIcon != null && this.Icon != null) _trayIcon.Icon = this.Icon;
-        this.HandleCreated += (s, e) => TryRegisterHotKey();
         this.FormClosing += CmdKitForm_FormClosing;
         _tooltipTimer.Interval = 200; _tooltipTimer.Tick += TooltipTimer_Tick; _tooltipTimer.Start();
     }
@@ -113,6 +173,7 @@ public partial class CmdKitForm : Sunny.UI.UIForm
             try { c.Font = _uiFont; } catch { }
             if (c.HasChildren) ApplyGlobalFont(c.Controls);
         }
+        this.Invalidate();
     }
 
     private void AdjustLayout()
@@ -163,41 +224,161 @@ public partial class CmdKitForm : Sunny.UI.UIForm
     private void ApplyTheme()
     {
         var (bg, surface, surfaceAlt, text, border, accentActive, blossom) = GetTheme();
+        _currentAccent = accentActive;
+        _isDarkTheme = _settings.Theme == AppTheme.Dark;
+        // derive multi-select colors for better contrast
+        _multiSelectFill = BuildMultiSelectFill(accentActive, surface, text, _isDarkTheme);
+        _multiSelectBorder = ChooseBorder(_multiSelectFill, surface, text);
         bool dark = _settings.Theme == AppTheme.Dark;
+
+        // Configure Sunny.UI base style
         if (dark)
         {
-            this.Style = Sunny.UI.UIStyle.Custom;
+            this.Style = Sunny.UI.UIStyle.Custom; // we will custom paint
             this.StyleCustomMode = true;
-            _styleMgr.Style = Sunny.UI.UIStyle.Gray;
+            _styleMgr.Style = Sunny.UI.UIStyle.Gray; // base neutral for dark
         }
-        else if (_settings.Theme == AppTheme.Light) _styleMgr.Style = Sunny.UI.UIStyle.Blue;
-        else if (_settings.Theme == AppTheme.Blossom) _styleMgr.Style = Sunny.UI.UIStyle.Red;
-
-        if (dark) this.BackColor = bg;
-        ApplyThemeColorsToForm(this, bg, surface, surfaceAlt, text, border, accentActive, blossom);
-        ApplySunnyUiControlColors(bg, surface, surfaceAlt, text, border, accentActive); // call existing overload
-        if (dark) // enforce custom mode immediately
+        else if (_settings.Theme == AppTheme.Light)
         {
+            _styleMgr.Style = Sunny.UI.UIStyle.Blue; // let library handle accents
+            this.Style = Sunny.UI.UIStyle.Blue;
+            this.StyleCustomMode = false;
+            ResetSunnyUiCustomMode(this);
+        }
+        else if (_settings.Theme == AppTheme.Blossom)
+        {
+            _styleMgr.Style = Sunny.UI.UIStyle.Red;
+            this.Style = Sunny.UI.UIStyle.Red;
+            this.StyleCustomMode = false;
+            ResetSunnyUiCustomMode(this);
+        }
+
+        if (dark) this.BackColor = bg; else this.BackColor = bg; // consistent
+
+        ApplyThemeColorsToForm(this, bg, surface, surfaceAlt, text, border, accentActive, blossom);
+        ApplySunnyUiControlColors(bg, surface, surfaceAlt, text, border, accentActive); // only applies deep changes for dark now
+        if (dark)
+        {
+            // enforce palette immediately & schedule idle finalize
             ForceDarkControlPalette(surface, surfaceAlt, text, border, accentActive);
         }
         ApplyTitleBarColors(bg, surface, surfaceAlt, text, border, accentActive, dark);
         ApplyFixedTitleFont();
         listEntries?.Invalidate();
+
+        // Re-schedule post-apply finalize per theme to capture late Sunny.UI paints
+        Application.Idle -= ThemeIdleFinalize; // avoid duplicates
+        Application.Idle += ThemeIdleFinalize;
+
+        // Re-arm dark idle fix every time dark theme is applied
+        if (dark)
+        {
+            _pendingDarkIdleFix = true;
+            Application.Idle -= Application_Idle_DarkFix;
+            Application.Idle += Application_Idle_DarkFix;
+        }
+    }
+
+    private void ThemeIdleFinalize(object? sender, EventArgs e)
+    {
+        Application.Idle -= ThemeIdleFinalize;
+        try
+        {
+            if (_settings.Theme == AppTheme.Dark)
+            {
+                // one more enforcement for dark palette to avoid drift
+                var (bg, surface, surfaceAlt, text, border, accentActive, _) = GetTheme();
+                ForceDarkControlPalette(surface, surfaceAlt, text, border, accentActive);
+            }
+            else
+            {
+                // ensure default accent colors restored (turn off custom mode again)
+                ResetSunnyUiCustomMode(this);
+            }
+            listEntries?.Invalidate();
+            txtSearch?.Invalidate();
+        }
+        catch { }
+    }
+
+    // Reset StyleCustomMode=false recursively for Sunny.UI controls so their internal style colors are used
+    private void ResetSunnyUiCustomMode(Control root)
+    {
+        if (root == null) return;
+        if (root.GetType().Namespace?.StartsWith("Sunny.UI") == true)
+        {
+            TrySetProp(root, "StyleCustomMode", false);
+        }
+        foreach (Control c in root.Controls) ResetSunnyUiCustomMode(c);
+    }
+
+    private Color BuildMultiSelectFill(Color accent, Color surface, Color text, bool dark)
+    {
+        // If accent too close to surface, shift it.
+        double Contrast(Color a, Color b)
+        {
+            double Lum(Color c)
+            {
+                static double Srgb(double ch) { ch /= 255.0; return ch <= 0.03928 ? ch / 12.92 : Math.Pow((ch + 0.055)/1.055,2.4); }
+                return 0.2126*Srgb(c.R)+0.7152*Srgb(c.G)+0.0722*Srgb(c.B);
+            }
+            double l1 = Lum(a)+0.05, l2 = Lum(b)+0.05; return l1>l2? l1/l2 : l2/l1;
+        }
+        var baseContrast = Contrast(accent, surface);
+        Color adj = accent;
+        if (baseContrast < 2.2)
+        {
+            // push away: if dark theme lighten, else darken
+            if (dark)
+            {
+                int r = Math.Min(255, accent.R + 40);
+                int g = Math.Min(255, accent.G + 40);
+                int b = Math.Min(255, accent.B + 40);
+                adj = Color.FromArgb(adjustAlpha(accent.A), r,g,b);
+            }
+            else
+            {
+                int r = Math.Max(0, accent.R - 50);
+                int g = Math.Max(0, accent.G - 50);
+                int b = Math.Max(0, accent.B - 50);
+                adj = Color.FromArgb(adjustAlpha(accent.A), r,g,b);
+            }
+        }
+        else adj = Color.FromArgb(adjustAlpha(accent.A), accent.R, accent.G, accent.B);
+        return adj;
+
+        int adjustAlpha(int a) => 220; // strong overlay
+    }
+
+    private Color ChooseBorder(Color fill, Color surface, Color text)
+    {
+        // simple contrast-based border (1px)
+        int diff = Math.Abs(fill.R - surface.R) + Math.Abs(fill.G - surface.G) + Math.Abs(fill.B - surface.B);
+        if (diff < 120)
+        {
+            // pick text color for border
+            return text;
+        }
+        // subtle lighter/darker border
+        int r = Math.Min(255, fill.R + (_isDarkTheme ? 30 : -30));
+        int g = Math.Min(255, fill.G + (_isDarkTheme ? 30 : -30));
+        int b = Math.Min(255, fill.B + (_isDarkTheme ? 30 : -30));
+        r = Math.Max(0,r); g = Math.Max(0,g); b = Math.Max(0,b);
+        return Color.FromArgb(255, r,g,b);
     }
 
     private void ApplyFixedTitleFont()
     {
-        // Force TitleFont to 8f exactly once
         if (_titleFontAdjusted) return;
         try
         {
             var f = this.TitleFont; if (f == null) return;
-            const float target = 8f;
+            const float target = 10f; // enlarge title font
             if (Math.Abs(f.Size - target) > 0.1f)
             {
                 this.TitleFont = new Font(f.FontFamily, target, f.Style, f.Unit);
             }
-            this.TitleHeight = (int)Math.Ceiling(this.TitleFont.GetHeight() + 6);
+            this.TitleHeight = (int)Math.Ceiling(this.TitleFont.GetHeight() + 8);
             _titleFontAdjusted = true;
         }
         catch { }
@@ -304,33 +485,78 @@ public partial class CmdKitForm : Sunny.UI.UIForm
     {
         ApplyGlobalFont(this.Controls);
         bool dark = _settings.Theme == AppTheme.Dark;
+        // For non-dark themes, rely on Sunny.UI built-in styling; only apply minimal text / watermark adjustments
+        if (!dark)
+        {
+            if (txtSearch != null)
+            {
+                if (string.IsNullOrEmpty(txtSearch.Text)) txtSearch.Watermark = "Search...";
+                txtSearch.Font = _uiFont;
+                // Improve placeholder contrast for light / blossom themes
+                try
+                {
+                    var (_, _, _, textColor, _, _, _) = GetTheme();
+                    // semi-transparent version of text color (or fallback gray)
+                    var wm = Color.FromArgb(140, textColor);
+                    TrySetProp(txtSearch, "WatermarkColor", wm);
+                }
+                catch { }
+            }
+            if (lblStatus != null) lblStatus.Font = _uiFont;
+            return; // skip deep color overrides so accent blues/reds remain intact
+        }
+
+        // Dark theme custom coloring below
         if (txtSearch != null)
         {
-            if (dark) txtSearch.StyleCustomMode = true;
+            txtSearch.StyleCustomMode = true;
             txtSearch.FillColor = surface; txtSearch.RectColor = border; txtSearch.ForeColor = text; if (string.IsNullOrEmpty(txtSearch.Text)) txtSearch.Watermark = "Search..."; txtSearch.Font = _uiFont; 
+            TrySetProp(txtSearch, "FillColor2", surface);
+            TrySetProp(txtSearch, "FillDisableColor", surface);
+            TrySetProp(txtSearch, "FillReadOnlyColor", surface);
+            TrySetProp(txtSearch, "RectDisableColor", border);
+            TrySetProp(txtSearch, "RectReadOnlyColor", border);
+            TrySetProp(txtSearch, "RectHoverColor", border);
+            TrySetProp(txtSearch, "RectFocusColor", border);
+            TrySetProp(txtSearch, "ForeDisableColor", text);
+            TrySetProp(txtSearch, "ForeReadOnlyColor", text);
+            TrySetProp(txtSearch, "FillHoverColor", surface);
+            TrySetProp(txtSearch, "FillPressColor", surface);
+            TrySetProp(txtSearch, "FillFocusColor", surface);
+            TrySetProp(txtSearch, "FillSelectedColor", surface);
+            txtSearch.ControlAdded -= TxtSearch_ControlAdded; // avoid duplicates
+            txtSearch.ControlAdded += TxtSearch_ControlAdded;
+            txtSearch.Enter -= TxtSearch_Enter; txtSearch.Enter += TxtSearch_Enter; // ensure reapply
+            txtSearch.Leave -= TxtSearch_Leave; txtSearch.Leave += TxtSearch_Leave;
+            txtSearch.MouseEnter -= TxtSearch_MouseEnter; txtSearch.MouseEnter += TxtSearch_MouseEnter;
+            txtSearch.MouseLeave -= TxtSearch_MouseLeave; txtSearch.MouseLeave += TxtSearch_MouseLeave;
+            FixSearchInnerColors();
+            txtSearch.Invalidate();
+            Application.Idle -= SearchIdleEnforce; // avoid duplicates
+            Application.Idle += SearchIdleEnforce;
         }
         if (btnClearSearch != null)
         {
-            if (dark) btnClearSearch.StyleCustomMode = true;
+            btnClearSearch.StyleCustomMode = true;
             btnClearSearch.FillColor = surface; btnClearSearch.RectColor = surface; btnClearSearch.ForeColor = text; btnClearSearch.FillHoverColor = surfaceAlt; btnClearSearch.FillPressColor = accent; btnClearSearch.Font = _uiFont;
         }
         if (cmbKindFilter != null)
         {
-            if (dark) cmbKindFilter.StyleCustomMode = true;
+            cmbKindFilter.StyleCustomMode = true;
             cmbKindFilter.FillColor = surface; cmbKindFilter.RectColor = border; cmbKindFilter.ForeColor = text; cmbKindFilter.DropDownStyle = Sunny.UI.UIDropDownStyle.DropDownList; cmbKindFilter.Font = _uiFont;
         }
         if (btnSettings != null)
         {
-            if (dark) btnSettings.StyleCustomMode = true;
+            btnSettings.StyleCustomMode = true;
             btnSettings.FillColor = surface; btnSettings.RectColor = surface; btnSettings.ForeColor = text; btnSettings.FillHoverColor = surfaceAlt; btnSettings.FillPressColor = accent; btnSettings.Font = _uiFont;
         }
         foreach (var b in new[] { btnAdd, btnCopy, btnImport, btnExport })
         {
-            if (b == null) continue; if (dark) b.StyleCustomMode = true; b.FillColor = surface; b.RectColor = border; b.ForeColor = text; b.FillHoverColor = surfaceAlt; b.FillPressColor = accent; b.RectHoverColor = border; b.RectPressColor = accent; b.Font = _uiFont;
+            if (b == null) continue; b.StyleCustomMode = true; b.FillColor = surface; b.RectColor = border; b.ForeColor = text; b.FillHoverColor = surfaceAlt; b.FillPressColor = accent; b.RectHoverColor = border; b.RectPressColor = accent; b.Font = _uiFont;
         }
         if (listEntries != null)
         {
-            if (dark) listEntries.StyleCustomMode = true;
+            listEntries.StyleCustomMode = true;
             listEntries.FillColor = surface; listEntries.RectColor = border; listEntries.ForeColor = text; listEntries.ItemSelectBackColor = accent; listEntries.ItemSelectForeColor = Color.White; listEntries.Font = _uiFont;
             try { listEntries.HoverColor = GetBetterHover(surface, text, dark); } catch { }
         }
@@ -392,12 +618,21 @@ public partial class CmdKitForm : Sunny.UI.UIForm
     {
         LoadData();
         ApplyFilter();
+        // hook paint for multi-select overlay
+        if (listEntries != null)
+        {
+            listEntries.Paint -= listEntries_Paint;
+            listEntries.Paint += listEntries_Paint;
+            cmsGrid.Opening += CmsGrid_Opening;
+        }
     }
 
     private void LoadData()
     {
         try
         {
+            if (string.IsNullOrWhiteSpace(_dataFile))
+                _dataFile = Path.Combine(GetActiveDataDir(), "commands.json");
             if (!Directory.Exists(_dataDir)) Directory.CreateDirectory(_dataDir);
             if (File.Exists(_dataFile))
             {
@@ -482,6 +717,18 @@ public partial class CmdKitForm : Sunny.UI.UIForm
 
     private void ApplyFilter() => ScheduleFilter();
 
+    private IEnumerable<CommandEntry> GetMultiSelectedEntries()
+    {
+        if (_multiSelected.Count == 0)
+        {
+            var single = GetSelected();
+            if (single != null) yield return single;
+            yield break;
+        }
+        var names = _multiSelected.Where(i => i >= 0 && i < listEntries.Items.Count).Select(i => listEntries.Items[i]?.ToString()).Where(s => !string.IsNullOrEmpty(s)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var e in _all) if (names.Contains(e.Name)) yield return e;
+    }
+
     private CommandEntry? GetSelected()
     {
         if (listEntries.SelectedItem == null) return null;
@@ -504,14 +751,13 @@ public partial class CmdKitForm : Sunny.UI.UIForm
     }
 
     private void listEntries_DoubleClick(object sender, EventArgs e) => CopySelected();
-    private void listEntries_KeyDown(object sender, KeyEventArgs e) { if (e.KeyCode == Keys.Enter || (e.Control && e.KeyCode == Keys.C)) { CopySelected(); e.Handled = true; } }
+    private void listEntries_KeyDown(object sender, KeyEventArgs e) { if (e.KeyCode == Keys.Enter || (e.Control && e.KeyCode == Keys.C)) { CopySelected(); e.Handled = true; } else if (e.KeyCode == Keys.Delete) { btnDelete_Click(sender, EventArgs.Empty); e.Handled = true; } }
     private void listEntries_MouseMove(object sender, MouseEventArgs e)
     { 
-        // UIListBox does not derive from ListBox; compute index manually
         if (listEntries == null) return;
-        int itemHeight = listEntries.ItemHeight; // default property
-        if (itemHeight <= 0) itemHeight = (int)_uiFont.GetHeight() + 6;
-        int index = (e.Y / itemHeight);
+        int itemHeight = listEntries.ItemHeight; if (itemHeight <= 0) itemHeight = (int)_uiFont.GetHeight() + 6;
+        int first = GetFirstVisibleIndex();
+        int index = first + (e.Y / itemHeight);
         if (index < 0 || index >= listEntries.Items.Count) index = -1;
         if (index != _hoverIndex)
         {
@@ -519,15 +765,55 @@ public partial class CmdKitForm : Sunny.UI.UIForm
             _lastToolTipTime = DateTime.MinValue;
         }
     }
+    private void listEntries_MouseDown(object sender, MouseEventArgs e) { 
+        if (listEntries == null) return; 
+        int itemHeight = listEntries.ItemHeight; if (itemHeight <= 0) itemHeight = (int)_uiFont.GetHeight() + 6; 
+        int first = GetFirstVisibleIndex();
+        int index = first + (e.Y / itemHeight); if (index < 0 || index >= listEntries.Items.Count) index = -1; 
+        if (e.Button == MouseButtons.Left && index >= 0)
+        {
+            bool ctrl = (ModifierKeys & Keys.Control) == Keys.Control;
+            bool shift = (ModifierKeys & Keys.Shift) == Keys.Shift;
+            if (shift && _multiAnchor >= 0)
+            {
+                _multiSelected.Clear();
+                int a = Math.Min(_multiAnchor, index); int b = Math.Max(_multiAnchor, index);
+                for (int i = a; i <= b; i++) _multiSelected.Add(i);
+            }
+            else if (ctrl)
+            {
+                if (_multiSelected.Contains(index)) _multiSelected.Remove(index); else _multiSelected.Add(index);
+                _multiAnchor = index;
+            }
+            else
+            {
+                _multiSelected.Clear();
+                _multiSelected.Add(index);
+                _multiAnchor = index;
+            }
+            listEntries.SelectedIndex = index; 
+            listEntries.Invalidate();
+        }
+        else if (e.Button == MouseButtons.Right)
+        {
+            if (!_multiSelected.Contains(index))
+            {
+                _multiSelected.Clear();
+                if (index >= 0) { _multiSelected.Add(index); listEntries.SelectedIndex = index; _multiAnchor = index; }
+                listEntries.Invalidate();
+            }
+        }
+    }
     private void listEntries_MouseLeave(object? sender, EventArgs e) { _hoverIndex = -1; _listTooltip.Hide(listEntries); }
     private void ListTooltip_Popup(object? sender, PopupEventArgs e)
     {
-        // Recalculate size with chosen font
-        var text = e.ToolTipSize; // struct copy
         string tip = (sender as ToolTip)?.GetToolTip(listEntries) ?? string.Empty;
         var font = GetTooltipFont(tip);
-        var sz = TextRenderer.MeasureText(tip, font, new Size(600, 400), TextFormatFlags.NoPrefix | TextFormatFlags.WordBreak);
-        e.ToolTipSize = new Size(Math.Min(600, sz.Width + 12), Math.Min(600, sz.Height + 8));
+        // allow wider / taller tooltips to avoid clipping
+        var max = new Size(1000, 1400);
+        var measureBounds = new Size(max.Width, max.Height);
+        var sz = TextRenderer.MeasureText(tip, font, measureBounds, TextFormatFlags.NoPrefix | TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl);
+        e.ToolTipSize = new Size(Math.Min(max.Width, sz.Width + 14), Math.Min(max.Height, sz.Height + 10));
     }
 
     private void ListTooltip_Draw(object? sender, DrawToolTipEventArgs e)
@@ -541,9 +827,42 @@ public partial class CmdKitForm : Sunny.UI.UIForm
         TextRenderer.DrawText(e.Graphics, tip, font, new Rectangle(6,4,e.Bounds.Width-12,e.Bounds.Height-8), Color.White, TextFormatFlags.NoPrefix | TextFormatFlags.WordBreak);
     }
 
+    private void listEntries_Paint(object? sender, PaintEventArgs e)
+    {
+        if (listEntries == null || _multiSelected.Count <= 1) return; 
+        try
+        {
+            int itemHeight = listEntries.ItemHeight; if (itemHeight <= 0) itemHeight = (int)_uiFont.GetHeight() + 6;
+            int first = GetFirstVisibleIndex();
+            using var selBrush = new SolidBrush(_multiSelectFill);
+            using var borderPen = new Pen(_multiSelectBorder, 1f);
+            foreach (var i in _multiSelected)
+            {
+                if (i < 0 || i >= listEntries.Items.Count) continue;
+                int visibleRow = i - first; if (visibleRow < 0) continue;
+                int y = visibleRow * itemHeight; if (y >= listEntries.Height) continue;
+                var rect = new Rectangle(0, y, listEntries.Width - 1, itemHeight - 1);
+                e.Graphics.FillRectangle(selBrush, rect);
+                e.Graphics.DrawRectangle(borderPen, rect);
+            }
+        }
+        catch { }
+    }
+
+    private void TryEnableDoubleBuffer(Control? c)
+    {
+        if (c == null) return;
+        try
+        {
+            var prop = typeof(Control).GetProperty("DoubleBuffered", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            prop?.SetValue(c, true);
+        }
+        catch { }
+    }
+
+    // Restore tooltip font helper (CJK detection)
     private Font GetTooltipFont(string text)
     {
-        // if contains CJK range chars, use YaHei font
         if (text.Any(c => c > 0x3000))
         {
             _tooltipFontCjk ??= CreateCjkFont(_uiFont.Size);
@@ -562,39 +881,69 @@ public partial class CmdKitForm : Sunny.UI.UIForm
         return SystemFonts.DefaultFont;
     }
 
+    private string? _activeTooltipText; // last shown tooltip text cache
+    private int _activeTooltipIndex = -1; // last index tooltip was shown for
+    private DateTime _lastTooltipShowTime = DateTime.MinValue; // last actual Show()
+    private bool _lastShiftPressed = false; // track shift state to refresh encrypted tooltip
+
     private void TooltipTimer_Tick(object? sender, EventArgs e)
     {
         if (listEntries == null) return;
-        if (_hoverIndex < 0 || _hoverIndex >= listEntries.Items.Count) { _listTooltip.Hide(listEntries); return; }
-        // Reduce frequency
-        if ((DateTime.Now - _lastToolTipTime).TotalMilliseconds < 300) return;
+        bool shiftPressed = (Control.ModifierKeys & Keys.Shift) == Keys.Shift;
+        bool shiftChanged = shiftPressed != _lastShiftPressed;
+        if (_hoverIndex < 0 || _hoverIndex >= listEntries.Items.Count)
+        {
+            _listTooltip.Hide(listEntries); _activeTooltipIndex = -1; _activeTooltipText = null; _lastShiftPressed = shiftPressed; return;
+        }
+        // Only skip if same index, no shift change, and within cache interval
+        if (_hoverIndex == _activeTooltipIndex && !shiftChanged && (DateTime.Now - _lastTooltipShowTime).TotalMilliseconds < 800)
+            return;
         var name = listEntries.Items[_hoverIndex]?.ToString();
-        if (string.IsNullOrEmpty(name)) return;
+        if (string.IsNullOrEmpty(name)) { _lastShiftPressed = shiftPressed; return; }
         var entry = _all.FirstOrDefault(x => x.Name == name);
-        if (entry == null) return;
-        string tip;
+        if (entry == null) { _lastShiftPressed = shiftPressed; return; }
+        string raw;
         if (entry.IsEncrypted)
         {
             try
             {
-                if ((ModifierKeys & Keys.Shift) == Keys.Shift)
-                {
-                    tip = SecretProtector.Unprotect(entry.Value);
-                }
+                if (shiftPressed)
+                { raw = SecretProtector.Unprotect(entry.Value); }
                 else
                 {
                     var plain = SecretProtector.Unprotect(entry.Value);
-                    tip = entry.Name + " (secret)\n" + new string('*', Math.Min(plain.Length, 6)) + "  (Hold Shift to reveal)"; // updated hint to English
+                    raw = entry.Name + " (secret)\n" + new string('*', Math.Min(plain.Length, 6)) + "  (Hold Shift to reveal)";
                 }
             }
-            catch { tip = entry.Name + " (secret)"; }
+            catch { raw = entry.Name + " (secret)"; }
         }
-        else tip = entry.Value;
+        else raw = entry.Value;
+        string tip = WrapLongSegments(raw, 120);
+        // Skip only if identical text, same index, no shift change and still within longer cache window
+        if (!shiftChanged && _activeTooltipIndex == _hoverIndex && _activeTooltipText == tip && (DateTime.Now - _lastTooltipShowTime).TotalSeconds < 5)
+        { _lastShiftPressed = shiftPressed; return; }
         var clientPos = listEntries.PointToClient(Cursor.Position);
-        _listTooltip.Show(tip, listEntries, Math.Min(clientPos.X + 24, listEntries.Width - 60), clientPos.Y + 24, 4000);
-        _lastToolTipTime = DateTime.Now;
+        int duration = Math.Min(30000, Math.Max(6000, tip.Length * 40));
+        _listTooltip.Show(tip, listEntries, Math.Min(clientPos.X + 24, listEntries.Width - 60), clientPos.Y + 24, duration);
+        _activeTooltipIndex = _hoverIndex;
+        _activeTooltipText = tip;
+        _lastTooltipShowTime = DateTime.Now;
+        _lastShiftPressed = shiftPressed;
     }
-    private void listEntries_MouseDown(object sender, MouseEventArgs e) { if (e.Button == MouseButtons.Right) { int index = listEntries.IndexFromPoint(e.Location); if (index >= 0 && index < listEntries.Items.Count) listEntries.SelectedIndex = index; } }
+
+    private static string WrapLongSegments(string text, int maxRun)
+    {
+        if (string.IsNullOrEmpty(text) || maxRun <= 10) return text;
+        var sb = new System.Text.StringBuilder(text.Length + 32);
+        int run = 0;
+        foreach (char c in text)
+        {
+            if (c == '\n' || c == '\r' || c == ' ' || c == '\t') run = 0; else run++;
+            sb.Append(c);
+            if (run >= maxRun) { sb.Append('\n'); run = 0; }
+        }
+        return sb.ToString();
+    }
 
     private void cmbKindFilter_SelectedIndexChanged(object sender, EventArgs e) => ApplyFilter();
     private void txtSearch_TextChanged(object sender, EventArgs e)
@@ -604,7 +953,18 @@ public partial class CmdKitForm : Sunny.UI.UIForm
     private void btnEdit_Click(object sender, EventArgs e)
     { var sel = GetSelected(); if (sel == null) return; using var form = new AddEditCommandForm(sel); form.Owner = this; if (form.ShowDialog(this) == DialogResult.OK && form.Entry != null) { sel.Name = form.Entry.Name; sel.Value = form.Entry.Value; sel.Description = form.Entry.Description; sel.Kind = form.Entry.Kind; sel.UpdatedUtc = DateTime.UtcNow; SaveData(); ApplyFilter(); if (!string.IsNullOrWhiteSpace(sel.Kind)) { _kinds.Add(sel.Kind); RebuildKindFilterItems(); } } }
     private void btnDelete_Click(object sender, EventArgs e)
-    { var sel = GetSelected(); if (sel == null) return; if (MessageBox.Show("Delete this item: " + sel.Name + "?", "Confirm", MessageBoxButtons.YesNo) == DialogResult.Yes) { _all.Remove(sel); SaveData(); ApplyFilter(); } }
+    { 
+        var multi = GetMultiSelectedEntries().ToList();
+        if (multi.Count == 0) { var sel = GetSelected(); if (sel == null) return; multi.Add(sel); }
+        if (multi.Count == 0) return;
+        string prompt = multi.Count == 1 ? $"Delete this item: {multi[0].Name}?" : $"Delete these {multi.Count} items?";
+        if (MessageBox.Show(prompt, "Confirm", MessageBoxButtons.YesNo) == DialogResult.Yes)
+        {
+            foreach (var item in multi) _all.Remove(item);
+            _multiSelected.Clear();
+            SaveData(); ApplyFilter();
+        }
+    }
     private void btnCopy_Click(object sender, EventArgs e) => CopySelected();
     private void miCopy_Click(object sender, EventArgs e) => CopySelected();
     private void miEdit_Click(object sender, EventArgs e) => btnEdit_Click(sender, e);
@@ -666,16 +1026,38 @@ public partial class CmdKitForm : Sunny.UI.UIForm
     private void UpdateStatus(string text) { this.Text = "CmdKit - " + text; if (lblStatus != null) lblStatus.Text = text; }
 
     private void btnSettings_Click(object sender, EventArgs e)
-    { using var dlg = new SettingsForm(_settings); dlg.Owner = this; if (dlg.ShowDialog(this) == DialogResult.OK) { _settings.Save(); _dataFile = Path.Combine(GetActiveDataDir(), "commands.json"); LoadData(); ApplyFilter(); ApplyTheme(); if (_trayIcon != null && this.Icon != null) _trayIcon.Icon = this.Icon; } }
+    { using var dlg = new SettingsForm(_settings); dlg.Owner = this; if (dlg.ShowDialog(this) == DialogResult.OK) { float prevSize = _uiFont.Size; _settings.Save(); _dataFile = Path.Combine(GetActiveDataDir(), "commands.json");
+            if (Math.Abs(prevSize - _settings.UiFontSize) > 0.1f)
+            {
+                try { var nf = CreateUiFont(_settings.UiFontSize); var old = _uiFont; _uiFont = nf; old.Dispose(); } catch { }
+                ApplyGlobalFont(this.Controls);
+            }
+            LoadData(); ApplyFilter(); ApplyTheme(); if (_trayIcon != null && this.Icon != null) _trayIcon.Icon = this.Icon; } }
 
     private void InitTray()
     {
         _trayIcon = new NotifyIcon { Icon = this.Icon ?? SystemIcons.Application, Text = "CmdKit (Ctrl+Q)", Visible = true, ContextMenuStrip = new ContextMenuStrip() };
+        _trayIcon.ContextMenuStrip.Opening += CmsGrid_Opening;
         _trayIcon.ContextMenuStrip.Items.Add("Show", null, (s, e) => ShowAndActivate());
         _trayIcon.ContextMenuStrip.Items.Add("Exit", null, (s, e) => { _allowExit = true; UnregisterAndDispose(); Application.Exit(); });
         _trayIcon.DoubleClick += (s, e) => ShowAndActivate();
     }
-    private void TryRegisterHotKey() { try { UnregisterHotKey(this.Handle, HOTKEY_ID); RegisterHotKey(this.Handle, HOTKEY_ID, MOD_CONTROL, (int)Keys.Q); } catch (Exception ex) { UpdateStatus("Hotkey error: " + ex.Message); } }
+
+    private void CmsGrid_Opening(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        // update context menu item text for delete when multi selected in main list context menu
+        try
+        {
+            if (cmsGrid != null && miDelete != null)
+            {
+                int count = _multiSelected.Count == 0 ? (GetSelected() != null ? 1 : 0) : _multiSelected.Count;
+                miDelete.Text = count > 1 ? $"Delete ({count})" : "Delete";
+            }
+        }
+        catch { }
+    }
+
+    private void TryRegisterHotKey() { /* no-op: handled by GlobalHotkeyHost */ }
     private void ShowAndActivate() { if (this.WindowState == FormWindowState.Minimized) this.WindowState = FormWindowState.Normal; if (!this.Visible) { ApplyTheme(); this.Show(); } else ApplyTheme(); this.Activate(); txtSearch.Focus(); }
     public void BringToFrontExternal()
     {
@@ -692,29 +1074,56 @@ public partial class CmdKitForm : Sunny.UI.UIForm
     }
     private void ToggleVisibility() { if (this.Visible && this.WindowState != FormWindowState.Minimized) this.Hide(); else BringToFrontExternal(); }
     protected override void WndProc(ref Message m)
-    { if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HOTKEY_ID) { ToggleVisibility(); return; } else if (m.Msg == (int)Program.WM_SHOWAPP) { BringToFrontExternal(); return; } base.WndProc(ref m); }
+    {
+        // only handle custom sizing; global hotkey handled by GlobalHotkeyHost hidden window
+        if (m.Msg == WM_NCHITTEST && this.FormBorderStyle == FormBorderStyle.Sizable)
+        {
+            base.WndProc(ref m);
+            if ((int)m.Result == HTCLIENT)
+            {
+                const int grip = 6;
+                Point p = PointToClient(new Point((int)m.LParam & 0xFFFF, (int)m.LParam >> 16));
+                bool left = p.X <= grip;
+                bool right = p.X >= Width - grip;
+                bool top = p.Y <= grip;
+                bool bottom = p.Y >= Height - grip;
+                if (left && top) m.Result = (IntPtr)HTTOPLEFT;
+                else if (right && top) m.Result = (IntPtr)HTTOPRIGHT;
+                else if (left && bottom) m.Result = (IntPtr)HTBOTTOMLEFT;
+                else if (right && bottom) m.Result = (IntPtr)HTBOTTOMRIGHT;
+                else if (left) m.Result = (IntPtr)HTLEFT;
+                else if (right) m.Result = (IntPtr)HTRIGHT;
+                else if (top) m.Result = (IntPtr)HTTOP;
+                else if (bottom) m.Result = (IntPtr)HTBOTTOM;
+            }
+            return;
+        }
+        base.WndProc(ref m);
+    }
+
     private void CmdKitForm_FormClosing(object? sender, FormClosingEventArgs e) { if (!_allowExit) { e.Cancel = true; this.Hide(); } else { UnregisterAndDispose(); } }
-    private void UnregisterAndDispose() { try { UnregisterHotKey(this.Handle, HOTKEY_ID); } catch { } if (_trayIcon != null) { _trayIcon.Visible = false; _trayIcon.Dispose(); _trayIcon = null; } }
+    private void UnregisterAndDispose() { try { _hotkeyHost?.Dispose(); } catch { } if (_trayIcon != null) { _trayIcon.Visible = false; _trayIcon.Dispose(); _trayIcon = null; } }
 
     #region SettingsForm
     private class SettingsForm : Form
     {
-        private readonly AppSettings _settings; private TextBox txtPath = new(); private Button btnBrowse = new(); private ComboBox cmbTheme = new(); private Button btnOk = new(); private Button btnCancel = new(); private CheckBox chkAutoClose = new();
+        private readonly AppSettings _settings; private TextBox txtPath = new(); private Button btnBrowse = new(); private ComboBox cmbTheme = new(); private Button btnOk = new(); private Button btnCancel = new(); private CheckBox chkAutoClose = new(); private NumericUpDown nudFont = new();
         public SettingsForm(AppSettings settings)
         {
-            _settings = settings; Text = "Settings"; Width = 420; Height = 260; FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false; StartPosition = FormStartPosition.CenterParent;
-            int left = 20; int top = 20; int labelW = 110; int gap = 32; int inputLeft = left + labelW + 6; int inputW = 230;
+            _settings = settings; Text = "Settings"; Width = 520; Height = 360; FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false; StartPosition = FormStartPosition.CenterParent;
+            int left = 24; int top = 24; int labelW = 140; int gap = 40; int inputLeft = left + labelW + 8; int inputW = 260;
             var defaultPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "CmdKit");
             string initialPath = string.IsNullOrWhiteSpace(_settings.DataPath) ? defaultPath : _settings.DataPath;
-            Controls.Add(MakeLabel("Data Folder", left, top)); txtPath.SetBounds(inputLeft, top - 2, inputW, 23); txtPath.Text = initialPath; Controls.Add(txtPath); btnBrowse.Text = "..."; btnBrowse.SetBounds(inputLeft + inputW + 5, top - 2, 30, 23); btnBrowse.Click += Browse; Controls.Add(btnBrowse); top += gap;
-            Controls.Add(MakeLabel("Theme", left, top)); cmbTheme.SetBounds(inputLeft, top - 2, 160, 23); cmbTheme.DropDownStyle = ComboBoxStyle.DropDownList; cmbTheme.Items.AddRange(new object[] { AppTheme.Dark.ToString(), AppTheme.Light.ToString(), AppTheme.Blossom.ToString() }); cmbTheme.SelectedItem = _settings.Theme.ToString(); Controls.Add(cmbTheme); top += gap;
-            chkAutoClose.Text = "Auto close after copy"; chkAutoClose.SetBounds(inputLeft, top - 6, 200, 24); chkAutoClose.Checked = _settings.AutoCloseAfterCopy; Controls.Add(chkAutoClose); top += gap;
-            btnOk.Text = "OK"; btnOk.SetBounds(inputLeft + 40, top, 80, 30); btnOk.Click += (s, e) => { Apply(); DialogResult = DialogResult.OK; };
-            btnCancel.Text = "Cancel"; btnCancel.SetBounds(inputLeft + 130, top, 80, 30); btnCancel.Click += (s, e) => DialogResult = DialogResult.Cancel; Controls.Add(btnOk); Controls.Add(btnCancel);
+            Controls.Add(MakeLabel("Data Folder", left, top)); txtPath.SetBounds(inputLeft, top - 2, inputW, 26); txtPath.Text = initialPath; Controls.Add(txtPath); btnBrowse.Text = "..."; btnBrowse.SetBounds(inputLeft + inputW + 6, top - 2, 34, 26); btnBrowse.Click += Browse; btnBrowse.FlatStyle = FlatStyle.Flat; btnBrowse.FlatAppearance.BorderSize = 1; Controls.Add(btnBrowse); top += gap;
+            Controls.Add(MakeLabel("Theme", left, top)); cmbTheme.SetBounds(inputLeft, top - 2, 180, 26); cmbTheme.DropDownStyle = ComboBoxStyle.DropDownList; cmbTheme.Items.AddRange(new object[] { AppTheme.Dark.ToString(), AppTheme.Light.ToString(), AppTheme.Blossom.ToString() }); cmbTheme.SelectedItem = _settings.Theme.ToString(); Controls.Add(cmbTheme); top += gap;
+            Controls.Add(MakeLabel("Font Size", left, top)); nudFont.SetBounds(inputLeft, top - 2, 100, 26); nudFont.Minimum = 8; nudFont.Maximum = 24; nudFont.DecimalPlaces = 1; nudFont.Increment = 0.5M; nudFont.Value = (decimal)Math.Max(8, Math.Min(24, _settings.UiFontSize)); Controls.Add(nudFont); top += gap;
+            chkAutoClose.Text = "Auto close after copy"; chkAutoClose.SetBounds(inputLeft, top - 6, 220, 28); chkAutoClose.Checked = _settings.AutoCloseAfterCopy; Controls.Add(chkAutoClose); top += gap;
+            btnOk.Text = "OK"; btnOk.SetBounds(inputLeft + 60, top, 90, 34); btnOk.Click += (s, e) => { Apply(); DialogResult = DialogResult.OK; };
+            btnCancel.Text = "Cancel"; btnCancel.SetBounds(inputLeft + 160, top, 90, 34); btnCancel.Click += (s, e) => DialogResult = DialogResult.Cancel; Controls.Add(btnOk); Controls.Add(btnCancel);
         }
         private void Browse(object? sender, EventArgs e) { using var f = new FolderBrowserDialog(); if (f.ShowDialog(this) == DialogResult.OK) txtPath.Text = f.SelectedPath; }
-        private void Apply() { _settings.DataPath = txtPath.Text.Trim(); if (Enum.TryParse<AppTheme>(cmbTheme.SelectedItem?.ToString(), out var theme)) _settings.Theme = theme; _settings.AutoCloseAfterCopy = chkAutoClose.Checked; }
-        private static Label MakeLabel(string text, int left, int top) => new() { Text = text, Left = left, Top = top, Width = 110, TextAlign = ContentAlignment.MiddleRight };
+        private void Apply() { _settings.DataPath = txtPath.Text.Trim(); if (Enum.TryParse<AppTheme>(cmbTheme.SelectedItem?.ToString(), out var theme)) _settings.Theme = theme; _settings.AutoCloseAfterCopy = chkAutoClose.Checked; _settings.UiFontSize = (float)nudFont.Value; }
+        private static Label MakeLabel(string text, int left, int top) => new() { Text = text, Left = left, Top = top, Width = 140, TextAlign = ContentAlignment.MiddleRight };
         protected override void OnLoad(EventArgs e) { base.OnLoad(e); (Owner as CmdKitForm)?.ApplyThemeToExternalForm(this); }
     }
     #endregion
@@ -728,8 +1137,6 @@ public partial class CmdKitForm : Sunny.UI.UIForm
         private readonly TextBox txtDesc = new();
         private readonly ComboBox cmbKind = new();
         private readonly CheckBox chkSecret = new();
-        private readonly Button btnToggleView = new();
-        private bool valueVisible = true;
         private readonly Button btnOk = new();
         private readonly Button btnCancel = new();
         public AddEditCommandForm(CommandEntry? existing = null)
@@ -737,21 +1144,16 @@ public partial class CmdKitForm : Sunny.UI.UIForm
             Entry = existing == null ? new CommandEntry() : new CommandEntry { Id = existing.Id, Name = existing.Name, Value = existing.Value, Description = existing.Description, Kind = existing.Kind, CreatedUtc = existing.CreatedUtc, UpdatedUtc = existing.UpdatedUtc };
             Text = existing == null ? "Add Entry" : "Edit Entry"; Width = 480; Height = 420; FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false; StartPosition = FormStartPosition.CenterParent;
             txtValue.Multiline = true; txtValue.Height = 70; txtValue.ScrollBars = ScrollBars.Vertical; txtDesc.Multiline = true; txtDesc.Height = 70; txtDesc.ScrollBars = ScrollBars.Vertical;
-            int left = 20; int top = 20; int lblw = 85; int gap = 32; int inputLeft = left + lblw + 6; int inputW = 300; int toggleW = 30;
-            Controls.Add(MakeLabel("Name", left, top)); txtName.SetBounds(inputLeft, top - 2, inputW + toggleW + 4, 23); txtName.Text = Entry!.Name; Controls.Add(txtName); top += gap;
-            Controls.Add(MakeLabel("Value", left, top)); txtValue.SetBounds(inputLeft, top - 2, inputW, 70); Controls.Add(txtValue);
-            btnToggleView.Text = string.Empty; btnToggleView.SetBounds(inputLeft + inputW + 6, top - 2, toggleW, 28); btnToggleView.FlatStyle = FlatStyle.Flat; btnToggleView.FlatAppearance.BorderSize = 0; var toggleBase = txtValue.BackColor; var toggleHover = ControlPaint.Light(toggleBase, .15f); btnToggleView.BackColor = toggleBase; btnToggleView.TabStop = false; btnToggleView.Click += (s, e) => ToggleView(); btnToggleView.Paint += BtnToggleView_Paint; btnToggleView.MouseEnter += (s, e) => btnToggleView.BackColor = toggleHover; btnToggleView.MouseLeave += (s, e) => btnToggleView.BackColor = toggleBase; Controls.Add(btnToggleView); top += 78;
-            Controls.Add(MakeLabel("Description", left, top)); txtDesc.SetBounds(inputLeft, top - 2, inputW + toggleW + 4, 70); txtDesc.Text = Entry.Description; Controls.Add(txtDesc); top += 78;
+            int left = 20; int top = 20; int lblw = 85; int gap = 32; int inputLeft = left + lblw + 6; int inputW = 330;
+            Controls.Add(MakeLabel("Name", left, top)); txtName.SetBounds(inputLeft, top - 2, inputW, 23); txtName.Text = Entry!.Name; Controls.Add(txtName); top += gap;
+            Controls.Add(MakeLabel("Value", left, top)); txtValue.SetBounds(inputLeft, top - 2, inputW, 70); Controls.Add(txtValue); top += 78;
+            Controls.Add(MakeLabel("Description", left, top)); txtDesc.SetBounds(inputLeft, top - 2, inputW, 70); txtDesc.Text = Entry.Description; Controls.Add(txtDesc); top += 78;
             Controls.Add(MakeLabel("Type", left, top)); cmbKind.SetBounds(inputLeft, top - 2, 200, 23); cmbKind.DropDownStyle = ComboBoxStyle.DropDown; cmbKind.AutoCompleteMode = AutoCompleteMode.SuggestAppend; cmbKind.AutoCompleteSource = AutoCompleteSource.CustomSource; Controls.Add(cmbKind); top += gap;
             chkSecret.Text = "Encrypt"; chkSecret.SetBounds(inputLeft, top - 4, 80, 24); chkSecret.Checked = Entry.IsEncrypted || ((CmdKitForm?)Owner)?.ShouldEncrypt(Entry!) == true; Controls.Add(chkSecret); top += gap;
             btnOk.Text = "OK"; btnOk.SetBounds(inputLeft + 60, top, 90, 32); btnOk.Click += (s, e) => OnOk();
             btnCancel.Text = "Cancel"; btnCancel.SetBounds(inputLeft + 160, top, 90, 32); btnCancel.Click += (s, e) => DialogResult = DialogResult.Cancel; Controls.AddRange(new Control[] { btnOk, btnCancel });
         }
         private static Label MakeLabel(string t, int l, int tp) => new() { Text = t, Left = l, Top = tp, Width = 85, TextAlign = ContentAlignment.MiddleRight };
-        private void BtnToggleView_Paint(object? sender, PaintEventArgs e)
-        {
-            var g = e.Graphics; g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias; var w = btnToggleView.ClientSize.Width; var h = btnToggleView.ClientSize.Height; var pad = 6; var eyeRect = new Rectangle(pad, pad, w - pad * 2, h - pad * 2); using var pen = new Pen(ForeColor, 1.8f); var arcRect = new Rectangle(eyeRect.X, eyeRect.Y + eyeRect.Height / 4, eyeRect.Width, eyeRect.Height / 2); g.DrawArc(pen, arcRect, 180, 180); g.DrawArc(pen, arcRect, 0, 180); int pupil = Math.Max(4, eyeRect.Height / 3); var pupilRect = new Rectangle(eyeRect.X + (eyeRect.Width - pupil) / 2, eyeRect.Y + (eyeRect.Height - pupil) / 2, pupil, pupil); if (valueVisible) { using var br = new SolidBrush(ForeColor); g.FillEllipse(br, pupilRect); } else { g.DrawEllipse(pen, pupilRect); g.DrawLine(pen, eyeRect.Right - 2, eyeRect.Top + 2, eyeRect.Left + 2, eyeRect.Bottom - 2); } }
-        private void ToggleView() { valueVisible = !valueVisible; if (valueVisible) txtValue.PasswordChar = '\0'; else if (txtValue.PasswordChar == '\0') txtValue.PasswordChar = '•'; btnToggleView.Invalidate(); }
         private void OnOk()
         {
             if (string.IsNullOrWhiteSpace(txtName.Text) || string.IsNullOrWhiteSpace(txtValue.Text)) { MessageBox.Show("Name and Value are required."); return; }
@@ -765,7 +1167,6 @@ public partial class CmdKitForm : Sunny.UI.UIForm
             (Owner as CmdKitForm)?.ApplyThemeToExternalForm(this);
             if (Entry!.IsEncrypted) { txtValue.Text = SecretProtector.Unprotect(Entry.Value); } else txtValue.Text = Entry.Value;
         }
-
         private void PopulateKinds()
         {
             try
@@ -794,8 +1195,9 @@ public partial class CmdKitForm : Sunny.UI.UIForm
     {
         if (disposing)
         {
+            try { _hotkeyHost?.Dispose(); } catch { }
             _filterCts?.Cancel(); _filterCts?.Dispose(); _listTooltip?.Dispose(); _trayIcon?.Dispose(); _tooltipTimer?.Stop(); _tooltipTimer?.Dispose();
-            // removed _titleFontOverride disposal (no longer used)
+            _searchEnforceTimer?.Stop(); _searchEnforceTimer?.Dispose();
         }
         base.Dispose(disposing);
     }
@@ -808,4 +1210,133 @@ public partial class CmdKitForm : Sunny.UI.UIForm
         return false;
     }
     private bool ShouldEncrypt(CommandEntry e) => MatchesSensitive(e.Name) || MatchesSensitive(e.Kind) || MatchesSensitive(e.Description ?? string.Empty);
+    private void TxtSearch_ControlAdded(object? sender, ControlEventArgs e) => FixSearchInnerColors();
+    private void TxtSearch_Enter(object? sender, EventArgs e) => FixSearchInnerColors();
+    private void TxtSearch_Leave(object? sender, EventArgs e) => FixSearchInnerColors();
+    private void SearchIdleEnforce(object? sender, EventArgs e) { Application.Idle -= SearchIdleEnforce; FixSearchInnerColors(); txtSearch?.Invalidate(); }
+    private void TxtSearch_MouseEnter(object? sender, EventArgs e)
+    {
+        if (_settings.Theme == AppTheme.Dark)
+        {
+            ForceSearchColorsDark();
+            if (!_searchEnforceTimer.Enabled) _searchEnforceTimer.Start();
+        }
+    }
+    private void TxtSearch_MouseLeave(object? sender, EventArgs e)
+    {
+        if (_settings.Theme == AppTheme.Dark && txtSearch != null && !txtSearch.Focused)
+        {
+            Task.Delay(200).ContinueWith(_ => { try { if (txtSearch != null && !txtSearch.IsDisposed && !txtSearch.Focused) _searchEnforceTimer?.Stop(); } catch { } });
+        }
+    }
+
+    // Determine first visible item index in listEntries (Sunny.UI.UIListBox) using multiple fallbacks
+    private int GetFirstVisibleIndex()
+    {
+        if (listEntries == null || listEntries.Items.Count == 0) return 0;
+        int top = 0;
+        try
+        {
+            // 1. Try public/reflective TopIndex property (standard ListBox style)
+            var p = listEntries.GetType().GetProperty("TopIndex", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            if (p != null && p.PropertyType == typeof(int))
+            {
+                top = (int)p.GetValue(listEntries)!;
+                return ClampTop(top);
+            }
+        }
+        catch { }
+        try
+        {
+            // 2. Try internal field names often used
+            string[] fieldCandidates = { "topIndex", "_topIndex", "firstVisible", "_firstVisible", "startIndex" };
+            foreach (var fName in fieldCandidates)
+            {
+                var f = listEntries.GetType().GetField(fName, System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                if (f != null && f.FieldType == typeof(int))
+                {
+                    top = (int)f.GetValue(listEntries)!;
+                    return ClampTop(top);
+                }
+            }
+        }
+        catch { }
+        try
+        {
+            // 3. Derive from embedded vScrollBar
+            var vsbField = listEntries.GetType().GetField("vScrollBar", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            if (vsbField?.GetValue(listEntries) is ScrollBar vsb)
+            {
+                int itemHeight = listEntries.ItemHeight; if (itemHeight <= 0) itemHeight = (int)_uiFont.GetHeight() + 6;
+                // If Value increments by 1 per item, treat directly; if large, divide by itemHeight
+                if (vsb.LargeChange <= listEntries.Items.Count + 1 && vsb.Maximum <= listEntries.Items.Count + vsb.LargeChange + 2)
+                {
+                    top = vsb.Value; // per-item mode
+                }
+                else
+                {
+                    top = vsb.Value / Math.Max(1, itemHeight); // pixel mode -> per-item
+                }
+                return ClampTop(top);
+            }
+        }
+        catch { }
+        return 0;
+
+        int ClampTop(int t) => t < 0 ? 0 : (t >= listEntries.Items.Count ? listEntries.Items.Count - 1 : t);
+    }
+
+    private (int scrollVal, bool pixelBased) GetListScrollOffset()
+    {
+        // Deprecated: replaced by GetFirstVisibleIndex for accurate hit testing
+        return (0, true);
+    }
+
+    private class GlobalHotkeyHost : NativeWindow, IDisposable
+    {
+        private readonly CmdKitForm _owner;
+        private const int WM_HOTKEY = 0x0312;
+        private const int HOTKEY_ID = 0x1100;
+        private const int MOD_CONTROL = 0x0002;
+        [DllImport("user32.dll")] private static extern bool RegisterHotKey(IntPtr hWnd, int id, int fsModifiers, int vk);
+        [DllImport("user32.dll")] private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+        public GlobalHotkeyHost(CmdKitForm owner)
+        {
+            _owner = owner;
+            CreateHandle(new CreateParams()); // message-only like hidden window
+            Register();
+        }
+        private void Register()
+        {
+            try { UnregisterHotKey(Handle, HOTKEY_ID); } catch { }
+            try { RegisterHotKey(Handle, HOTKEY_ID, MOD_CONTROL, (int)Keys.Q); } catch { }
+        }
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HOTKEY_ID)
+            {
+                try { _owner.BeginInvoke(new Action(() => _owner.ToggleVisibility())); } catch { }
+            }
+            base.WndProc(ref m);
+        }
+        public void Dispose()
+        {
+            try { UnregisterHotKey(Handle, HOTKEY_ID); } catch { }
+            try { DestroyHandle(); } catch { }
+        }
+    }
+
+    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    private const int SW_SHOW = 5;
+    private const int WM_NCHITTEST = 0x0084;
+    private const int HTCLIENT = 1;
+    private const int HTLEFT = 10;
+    private const int HTRIGHT = 11;
+    private const int HTTOP = 12;
+    private const int HTTOPLEFT = 13;
+    private const int HTTOPRIGHT = 14;
+    private const int HTBOTTOM = 15;
+    private const int HTBOTTOMLEFT = 16;
+    private const int HTBOTTOMRIGHT = 17;
 }

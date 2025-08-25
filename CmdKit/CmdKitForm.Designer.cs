@@ -1,8 +1,11 @@
-﻿namespace CmdKit
+﻿using Sunny.UI; // for UI controls
+using System.ComponentModel; // for Container
+
+namespace CmdKit
 {
     partial class CmdKitForm
     {
-        private Sunny.UI.UITextBox txtSearch;
+        private CmdKit.Controls.FlatSearchTextBox txtSearch;
         private Sunny.UI.UIButton btnClearSearch; // clear search button
         private Sunny.UI.UIListBox listEntries;
         private Sunny.UI.UIButton btnAdd;
@@ -24,7 +27,7 @@
         private void InitializeComponent()
         {
             this.components = new System.ComponentModel.Container();
-            this.txtSearch = new Sunny.UI.UITextBox();
+            this.txtSearch = new CmdKit.Controls.FlatSearchTextBox();
             this.btnClearSearch = new Sunny.UI.UIButton();
             this.listEntries = new Sunny.UI.UIListBox();
             this.btnAdd = new Sunny.UI.UIButton();
@@ -69,7 +72,7 @@
             this.btnClearSearch.Name = "btnClearSearch";
             this.btnClearSearch.Size = new System.Drawing.Size(28, topH);
             this.btnClearSearch.TabIndex = 1;
-            this.btnClearSearch.Text = "×"; // multiply sign
+            this.btnClearSearch.Text = "✕"; // multiply sign
             this.btnClearSearch.Visible = false;
             this.btnClearSearch.Click += (s, e) => { this.txtSearch.Text = string.Empty; this.txtSearch.Focus(); };
             // kind filter
